@@ -1,0 +1,88 @@
+# Problem metadata for SOJ
+version: 1
+id: proj3
+text: |
+  CA Project 3 — Optimize the Lennard-Jones force computation in
+  src/optimized.c. Submit two files via SFTP to your problem dir:
+    * optimized.c    — your implementation of compute_forces_optimized()
+    * affinity.conf  — structured numactl config (see affinity.conf.example);
+                       at most one CPU binding and one memory binding.
+  For each N_i in 2M/4M/8M:
+    s_i = single_baseline_time_i / best_optimized_time_i.
+  Score = correctness gate + GeoSpeedup tier, where
+    GeoSpeedup = exp(avg_i(log(s_i))).
+weight: 1
+rankupdate: always
+
+submits:
+  - path: optimized.c
+    isdir: false
+  - path: affinity.conf
+    isdir: false
+
+# === SOJ package metadata ===
+package:
+  image:
+    def: Apptainer.def
+  scaffold:
+    - src/baseline.c
+    - src/nbody.h
+    - utils/
+    - Makefile
+    - bench.sh
+    - judge.sh
+    - parse_affinity.sh
+
+workflow:
+  - image: "{{.Image}}"
+    timeout: 240
+    disablenetwork: true
+    mask: true
+
+    # 安全信封：以 SubmitUid（默认 942）运行；apptainer --no-privs 清空全部
+    # capability 并设置 NoNewPrivs。numactl 的 sched_setaffinity / mbind 实际
+    # 不需要 CAP_SYS_NICE —— 下面 properties 里的 AllowedCPUs / AllowedMemoryNodes
+    # 已经把 numactl 能影响的范围 cgroup 化了，内核默认就放行子集内的 affinity
+    # 与 membind 调用。
+    # 默认 seccomp profile（仓库 seccomp/soj-default.json）会拦掉 io_uring、
+    # AF_ALG socket、unshare(CLONE_NEWUSER)、keyctl、bpf、perf_event_open、
+    # vmsplice 等已知 LPE 攻击面。
+    noprivs: true
+
+    mounts:
+      - type: bind
+        source: "{{.Scaffold}}"
+        target: /scaffold
+        readonly: true
+
+    properties:
+      - "AllowedCPUs=0-7"
+      - "AllowedMemoryNodes=0"
+      - "MemoryMax=4G"
+      - "MemorySwapMax=0"
+      - "CPUQuota=800%"
+      - "TasksMax=256"
+
+    show: [2, 3, 4]
+    steps:
+      # 1) Stage scaffold + student optimized.c; validate affinity.conf
+      #    into numactl_args.txt. parse_affinity.sh fails the step on any
+      #    illegal key or value, so students can't smuggle shell into the
+      #    launcher path.
+      - >
+        cp -r /scaffold /work/proj3 &&
+        cp /submits/optimized.c /work/proj3/src/optimized.c &&
+        /scaffold/parse_affinity.sh /submits/affinity.conf > /work/proj3/numactl_args.txt
+      # 2) Build.
+      - "cd /work/proj3 && make all 2>&1"
+      # 3) Correctness (problem-maintained; students cannot tamper).
+      - "cd /work/proj3 && make correctness 2>&1"
+      # 4) Performance: bench.sh samples near the nominal 2M/4M/8M sizes,
+      #    reads seed from /dev/urandom by default, and wraps nbody_optimized
+      #    with numactl using the validated args. Students never inject code
+      #    into this path.
+      - "cd /work/proj3 && ./bench.sh 2>&1 | tee /work/bench.log"
+      # 5) Trusted judge: parse bench.log -> score -> /result/result.json.
+      - "/scaffold/judge.sh /work/bench.log /result/result.json"
+      # 6) Clean up binary & output
+      - "cd /work/proj3 && make clean"

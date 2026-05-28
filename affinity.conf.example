@@ -1,0 +1,29 @@
+# Submit a copy of this file as `affinity.conf` to control how your
+# optimized binary is pinned. The SOJ grader runs:
+#
+#   numactl <options-from-this-file> ./bin/nbody_optimized N density seed out
+#
+# Format: one `key = value` per line. '#' starts a comment.
+# Values are restricted to digits, commas, and hyphens. Anything outside
+# this grammar — and anything outside the cgroup wall (AllowedCPUs=0-7,
+# AllowedMemoryNodes=0) — is rejected.
+#
+# === CPU binding (pick at most one) ===
+#   physcpubind = 0-3           # specific physical CPUs (range or list)
+#   cpunodebind = 0             # all CPUs of the given NUMA node(s)
+#
+# === Memory binding (pick at most one) ===
+#   membind     = 0             # allocate ONLY from these nodes
+#   interleave  = 0,1           # round-robin across nodes
+#   preferred   = 0             # prefer one node, spill to others
+#   localalloc  = true          # allocate on whichever node the CPU is on
+#
+# Inspect topology inside the SOJ container with:
+#   numactl -H
+#   hwloc-info
+#
+# An empty affinity.conf is legal and means "no numactl wrapping" (the
+# kernel scheduler picks any of the 8 CPUs allowed by cgroup).
+
+physcpubind = 0-127
+membind     = 0
