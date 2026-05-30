@@ -1,3 +1,4 @@
+#pragma GCC optimize("O3,unroll-loops,fast-math")
 #include "nbody.h"
 #include <immintrin.h>
 #include <omp.h>
@@ -20,6 +21,26 @@ typedef struct {
     int *order;      /* original particle index for each packed entry */
     double *x, *y, *z;
 } PackedCells;
+
+#ifndef FORCE_CHUNK
+#define FORCE_CHUNK 128
+#endif
+
+#ifndef SELF_CHUNK
+#define SELF_CHUNK 128
+#endif
+
+#ifndef PAIR_CHUNK
+#define PAIR_CHUNK 512
+#endif
+
+#ifndef RECIP_NR_STEPS
+#define RECIP_NR_STEPS 2
+#endif
+
+#ifndef PRIVATE_COUNT_MAX_THREADS
+#define PRIVATE_COUNT_MAX_THREADS 32
+#endif
 
 static void die_oom(void)
 {
@@ -61,7 +82,12 @@ static void pc_build(PackedCells *pc, const ParticleSystem *sys)
     const Vec3 *pos = sys->pos;
 
     int *cell_id = (int *)malloc((size_t)n * sizeof(int));
-    int *count = (int *)calloc((size_t)pc->ncells, sizeof(int));
+    int nthreads = omp_get_max_threads();
+    const int use_private_count = (nthreads <= PRIVATE_COUNT_MAX_THREADS);
+    size_t count_len = use_private_count
+        ? (size_t)nthreads * (size_t)pc->ncells
+        : (size_t)pc->ncells;
+    int *count = (int *)calloc(count_len, sizeof(int));
     pc->start = (int *)malloc((size_t)(pc->ncells + 1) * sizeof(int));
     pc->order = (int *)malloc((size_t)n * sizeof(int));
     pc->x = (double *)malloc((size_t)n * sizeof(double));
@@ -77,6 +103,7 @@ static void pc_build(PackedCells *pc, const ParticleSystem *sys)
 
 #pragma omp parallel for schedule(static)
     for (int i = 0; i < n; i++) {
+        int tid = omp_get_thread_num();
         int cx = (int)(pos[i].x * inv_cs);
         int cy = (int)(pos[i].y * inv_cs);
         int cz = (int)(pos[i].z * inv_cs);
@@ -86,21 +113,44 @@ static void pc_build(PackedCells *pc, const ParticleSystem *sys)
 
         int c = cell_flat(cx, cy, cz, ncy, ncz);
         cell_id[i] = c;
+        if (use_private_count) {
+            count[(size_t)tid * (size_t)pc->ncells + (size_t)c]++;
+        } else {
 #pragma omp atomic update
-        count[c]++;
+            count[c]++;
+        }
     }
 
-    pc->start[0] = 0;
-    for (int c = 0; c < pc->ncells; c++) {
-        pc->start[c + 1] = pc->start[c] + count[c];
-        count[c] = pc->start[c];
+    if (use_private_count) {
+        int running = 0;
+        for (int c = 0; c < pc->ncells; c++) {
+            pc->start[c] = running;
+            for (int t = 0; t < nthreads; t++) {
+                int cnt = count[(size_t)t * (size_t)pc->ncells + (size_t)c];
+                count[(size_t)t * (size_t)pc->ncells + (size_t)c] = running;
+                running += cnt;
+            }
+        }
+        pc->start[pc->ncells] = running;
+    } else {
+        pc->start[0] = 0;
+        for (int c = 0; c < pc->ncells; c++) {
+            pc->start[c + 1] = pc->start[c] + count[c];
+            count[c] = pc->start[c];
+        }
     }
 
 #pragma omp parallel for schedule(static)
     for (int i = 0; i < n; i++) {
+        int tid = omp_get_thread_num();
+        int c = cell_id[i];
         int dst;
+        if (use_private_count) {
+            dst = count[(size_t)tid * (size_t)pc->ncells + (size_t)c]++;
+        } else {
 #pragma omp atomic capture
-        dst = count[cell_id[i]]++;
+            dst = count[c]++;
+        }
         pc->order[dst] = i;
         pc->x[dst] = pos[i].x;
         pc->y[dst] = pos[i].y;
@@ -120,15 +170,22 @@ static inline double hsum4(__m256d v)
     return _mm_cvtsd_f64(sum);
 }
 
-static inline double min_image_d(double d, double box, double half_box)
+static inline __m256d recip4_pd(__m256d x)
 {
-    if (d > half_box) return d - box;
-    if (d < -half_box) return d + box;
-    return d;
+    __m128 xf = _mm256_cvtpd_ps(x);
+    __m256d y = _mm256_cvtps_pd(_mm_rcp_ps(xf));
+#if RECIP_NR_STEPS >= 1
+    const __m256d two = _mm256_set1_pd(2.0);
+    y = _mm256_mul_pd(y, _mm256_sub_pd(two, _mm256_mul_pd(x, y)));
+#endif
+#if RECIP_NR_STEPS >= 2
+    y = _mm256_mul_pd(y, _mm256_sub_pd(two, _mm256_mul_pd(x, y)));
+#endif
+    return y;
 }
 
 typedef struct {
-    __m256d box, half, neghalf, cut, one, two, c24, zero;
+    __m256d cut, one, two, c24, zero;
 } SimdConsts;
 
 static inline void add_cell_pair_vec(const PackedCells *pc,
@@ -136,7 +193,7 @@ static inline void add_cell_pair_vec(const PackedCells *pc,
                                      double *restrict fy,
                                      double *restrict fz,
                                      int c0, int c1,
-                                     double box, double half_box,
+                                     double sx, double sy, double sz,
                                      const SimdConsts *vc)
 {
     const double *restrict px = pc->x;
@@ -146,6 +203,9 @@ static inline void add_cell_pair_vec(const PackedCells *pc,
     const int a1 = pc->start[c0 + 1];
     const int b0 = pc->start[c1];
     const int b1 = pc->start[c1 + 1];
+    const __m256d vsx = _mm256_set1_pd(sx);
+    const __m256d vsy = _mm256_set1_pd(sy);
+    const __m256d vsz = _mm256_set1_pd(sz);
 
     for (int a = a0; a < a1; a++) {
         const double xi = px[a];
@@ -161,37 +221,23 @@ static inline void add_cell_pair_vec(const PackedCells *pc,
         int b = (c0 == c1) ? a + 1 : b0;
 
         for (; b + 3 < b1; b += 4) {
-            __m256d rx = _mm256_sub_pd(vxi, _mm256_loadu_pd(px + b));
-            __m256d ry = _mm256_sub_pd(vyi, _mm256_loadu_pd(py + b));
-            __m256d rz = _mm256_sub_pd(vzi, _mm256_loadu_pd(pz + b));
-
-            __m256d gt = _mm256_cmp_pd(rx, vc->half, _CMP_GT_OQ);
-            __m256d lt = _mm256_cmp_pd(rx, vc->neghalf, _CMP_LT_OQ);
-            rx = _mm256_sub_pd(rx, _mm256_and_pd(gt, vc->box));
-            rx = _mm256_add_pd(rx, _mm256_and_pd(lt, vc->box));
-            gt = _mm256_cmp_pd(ry, vc->half, _CMP_GT_OQ);
-            lt = _mm256_cmp_pd(ry, vc->neghalf, _CMP_LT_OQ);
-            ry = _mm256_sub_pd(ry, _mm256_and_pd(gt, vc->box));
-            ry = _mm256_add_pd(ry, _mm256_and_pd(lt, vc->box));
-            gt = _mm256_cmp_pd(rz, vc->half, _CMP_GT_OQ);
-            lt = _mm256_cmp_pd(rz, vc->neghalf, _CMP_LT_OQ);
-            rz = _mm256_sub_pd(rz, _mm256_and_pd(gt, vc->box));
-            rz = _mm256_add_pd(rz, _mm256_and_pd(lt, vc->box));
+            __m256d rx = _mm256_add_pd(_mm256_sub_pd(vxi, _mm256_loadu_pd(px + b)), vsx);
+            __m256d ry = _mm256_add_pd(_mm256_sub_pd(vyi, _mm256_loadu_pd(py + b)), vsy);
+            __m256d rz = _mm256_add_pd(_mm256_sub_pd(vzi, _mm256_loadu_pd(pz + b)), vsz);
 
             __m256d r2 = _mm256_fmadd_pd(rx, rx,
                           _mm256_fmadd_pd(ry, ry, _mm256_mul_pd(rz, rz)));
             __m256d mask = _mm256_cmp_pd(r2, vc->cut, _CMP_LT_OQ);
+            int maskbits = _mm256_movemask_pd(mask);
+            if (maskbits == 0) continue;
             r2 = _mm256_blendv_pd(vc->one, r2, mask);
-
-            __m256d r2inv = _mm256_div_pd(vc->one, r2);
+            __m256d r2inv = recip4_pd(r2);
             __m256d r6inv = _mm256_mul_pd(r2inv, _mm256_mul_pd(r2inv, r2inv));
-            __m256d fscal = _mm256_mul_pd(
-                vc->c24,
-                _mm256_mul_pd(
-                    r2inv,
-                    _mm256_sub_pd(_mm256_mul_pd(vc->two,
-                                                _mm256_mul_pd(r6inv, r6inv)),
-                                  r6inv)));
+            __m256d term = _mm256_fmsub_pd(vc->two,
+                                           _mm256_mul_pd(r6inv, r6inv),
+                                           r6inv);
+            __m256d fscal = _mm256_mul_pd(_mm256_mul_pd(vc->c24, r2inv),
+                                          term);
             fscal = _mm256_and_pd(fscal, mask);
 
             __m256d tx = _mm256_mul_pd(fscal, rx);
@@ -206,9 +252,9 @@ static inline void add_cell_pair_vec(const PackedCells *pc,
         }
 
         for (; b < b1; b++) {
-            double rx = min_image_d(xi - px[b], box, half_box);
-            double ry = min_image_d(yi - py[b], box, half_box);
-            double rz = min_image_d(zi - pz[b], box, half_box);
+            double rx = xi - px[b] + sx;
+            double ry = yi - py[b] + sy;
+            double rz = zi - pz[b] + sz;
             double r2 = rx * rx + ry * ry + rz * rz;
 
             if (r2 < LJ_CUTOFF_SQ) {
@@ -234,18 +280,42 @@ static inline void add_cell_pair_vec(const PackedCells *pc,
     }
 }
 
+static inline void add_offset_cell(const PackedCells *pc,
+                                   double *restrict fx,
+                                   double *restrict fy,
+                                   double *restrict fz,
+                                   int cx, int cy, int cz,
+                                   int dx, int dy, int dz,
+                                   int ncx, int ncy, int ncz,
+                                   double box,
+                                   const SimdConsts *vc)
+{
+    int nx = cx + dx;
+    int ny = cy + dy;
+    int nz = cz + dz;
+    const double sx = (nx < 0) ? box : ((nx >= ncx) ? -box : 0.0);
+    const double sy = (ny < 0) ? box : ((ny >= ncy) ? -box : 0.0);
+    const double sz = (nz < 0) ? box : ((nz >= ncz) ? -box : 0.0);
+    if (nx < 0) nx += ncx;
+    else if (nx >= ncx) nx -= ncx;
+    if (ny < 0) ny += ncy;
+    else if (ny >= ncy) ny -= ncy;
+    if (nz < 0) nz += ncz;
+    else if (nz >= ncz) nz -= ncz;
+
+    add_cell_pair_vec(pc, fx, fy, fz,
+                      (cx * ncy + cy) * ncz + cz,
+                      (nx * ncy + ny) * ncz + nz,
+                      sx, sy, sz, vc);
+}
+
 static void compute_packed_forces(ParticleSystem *sys, const PackedCells *pc)
 {
     const int ncx = pc->ncx, ncy = pc->ncy, ncz = pc->ncz;
-    const int ncyz = ncy * ncz;
     const double box = sys->box;
-    const double half_box = 0.5 * box;
     const int n = sys->n;
     const int *restrict order = pc->order;
     SimdConsts vc = {
-        _mm256_set1_pd(box),
-        _mm256_set1_pd(half_box),
-        _mm256_set1_pd(-half_box),
         _mm256_set1_pd(LJ_CUTOFF_SQ),
         _mm256_set1_pd(1.0),
         _mm256_set1_pd(2.0),
@@ -279,7 +349,7 @@ static void compute_packed_forces(ParticleSystem *sys, const PackedCells *pc)
 
 #pragma omp parallel for schedule(static)
     for (int c0 = 0; c0 < pc->ncells; c0++) {
-        add_cell_pair_vec(pc, fx, fy, fz, c0, c0, box, half_box, &vc);
+        add_cell_pair_vec(pc, fx, fy, fz, c0, c0, 0.0, 0.0, 0.0, &vc);
     }
 
     for (int oi = 0; oi < 13; oi++) {
@@ -290,33 +360,40 @@ static void compute_packed_forces(ParticleSystem *sys, const PackedCells *pc)
         const int limit = axis == 0 ? ncx : (axis == 1 ? ncy : ncz);
 
         for (int phase = 0; phase < 3; phase++) {
-#pragma omp parallel for schedule(static)
-            for (int c0 = 0; c0 < pc->ncells; c0++) {
-                const int cx = c0 / ncyz;
-                const int rem = c0 - cx * ncyz;
-                const int cy = rem / ncz;
-                const int cz = rem - cy * ncz;
-                const int coord = axis == 0 ? cx : (axis == 1 ? cy : cz);
+            const int start = (phase < 2) ? phase : limit - 1;
+            const int stop = (phase < 2) ? limit - 1 : limit;
+            const int step = (phase < 2) ? 2 : 1;
 
-                if (phase < 2) {
-                    if (coord >= limit - 1 || (coord & 1) != phase) continue;
-                } else {
-                    if (coord != limit - 1) continue;
+            if (axis == 0) {
+#pragma omp parallel for collapse(3) schedule(static)
+                for (int cx = start; cx < stop; cx += step) {
+                    for (int cy = 0; cy < ncy; cy++) {
+                        for (int cz = 0; cz < ncz; cz++) {
+                            add_offset_cell(pc, fx, fy, fz, cx, cy, cz,
+                                            dx, dy, dz, ncx, ncy, ncz, box, &vc);
+                        }
+                    }
                 }
-
-                int nx = cx + dx;
-                int ny = cy + dy;
-                int nz = cz + dz;
-                if (nx < 0) nx += ncx;
-                else if (nx >= ncx) nx -= ncx;
-                if (ny < 0) ny += ncy;
-                else if (ny >= ncy) ny -= ncy;
-                if (nz < 0) nz += ncz;
-                else if (nz >= ncz) nz -= ncz;
-
-                add_cell_pair_vec(pc, fx, fy, fz, c0,
-                                  (nx * ncy + ny) * ncz + nz,
-                                  box, half_box, &vc);
+            } else if (axis == 1) {
+#pragma omp parallel for collapse(3) schedule(static)
+                for (int cx = 0; cx < ncx; cx++) {
+                    for (int cy = start; cy < stop; cy += step) {
+                        for (int cz = 0; cz < ncz; cz++) {
+                            add_offset_cell(pc, fx, fy, fz, cx, cy, cz,
+                                            dx, dy, dz, ncx, ncy, ncz, box, &vc);
+                        }
+                    }
+                }
+            } else {
+#pragma omp parallel for collapse(3) schedule(static)
+                for (int cx = 0; cx < ncx; cx++) {
+                    for (int cy = 0; cy < ncy; cy++) {
+                        for (int cz = start; cz < stop; cz += step) {
+                            add_offset_cell(pc, fx, fy, fz, cx, cy, cz,
+                                            dx, dy, dz, ncx, ncy, ncz, box, &vc);
+                        }
+                    }
+                }
             }
         }
     }
